@@ -52,6 +52,65 @@ export function hint(msg) {
   console.log(dim(`提示: ${msg}`));
 }
 
+/**
+ * One redrawn status line for a phase that would otherwise leave the terminal
+ * blank for minutes: the settings round-trip (a timing-out endpoint re-trying),
+ * the local log scan, and a cold Codex index build. Without it the sync header
+ * is the last thing on screen, and "still working" is indistinguishable from
+ * "hung" — exactly how a slow first sync reads.
+ *
+ * TTY-only for the same reason as hint(): the Mac (`SyncEngine.swift`) and
+ * Windows (`sync_engine.rs`) apps run `sync` through a pipe and treat stdout as
+ * the result text, so a pipe must never receive these lines.
+ * `VIBE_USAGE_FORCE_PROGRESS=1` forces them on for tests, and
+ * `VIBE_USAGE_PROGRESS_INTERVAL_MS` overrides the redraw interval.
+ *
+ * `label` is a function so the caller owns the wording and its elapsed-time
+ * text; it is re-read on every redraw. The interval is unref'ed so a phase that
+ * never reaches `stop()` cannot hold the process open.
+ */
+export function liveStatus({ enabled = true, intervalMs } = {}) {
+  const configuredInterval = Number(process.env.VIBE_USAGE_PROGRESS_INTERVAL_MS);
+  const tickMs = intervalMs ?? (configuredInterval > 0 ? configuredInterval : 5000);
+  const active = enabled
+    && (!!process.stdout.isTTY || process.env.VIBE_USAGE_FORCE_PROGRESS === '1');
+  let label = null;
+  let timer = null;
+  let startedAt = 0;
+
+  function draw() {
+    if (label === null) return;
+    process.stdout.write(`\r${dim(`  ${label(Date.now() - startedAt)}`)}\x1b[K`);
+  }
+
+  return {
+    /** Show the line, or retarget it to the next phase. */
+    start(nextLabel) {
+      if (!active) return;
+      label = nextLabel;
+      startedAt = Date.now();
+      draw();
+      if (timer === null) {
+        timer = setInterval(draw, tickMs);
+        unrefTimer(timer);
+      }
+    },
+    /** Erase the line before regular output continues on it. */
+    stop() {
+      if (!active || label === null) return;
+      clearInterval(timer);
+      timer = null;
+      label = null;
+      process.stdout.write('\r\x1b[K');
+    },
+  };
+}
+
+/** Bun's timer objects and Node's both expose unref; tests run on either. */
+function unrefTimer(timer) {
+  if (typeof timer?.unref === 'function') timer.unref();
+}
+
 /** Print a blank line. */
 export const nl = () => console.log();
 

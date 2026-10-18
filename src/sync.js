@@ -11,7 +11,7 @@ import { aggregateToBuckets } from './parsers/aggregate.js';
 import { normalizeParserResult } from './parsers/contract.js';
 import { extraRootList } from './extra-roots.js';
 import { planKikiMigration } from './kiki-migration.js';
-import { success, failure, warn, arrow, link, dim } from './output.js';
+import { success, failure, warn, arrow, link, dim, liveStatus } from './output.js';
 
 const BATCH_SIZE = 100;
 const SESSION_BATCH_SIZE = 500;
@@ -42,6 +42,11 @@ function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+/** Elapsed-time suffix for the live status line (`formatDuration` rounds 0 to `0s`). */
+function phaseElapsed(elapsedMs) {
+  return ` · 已用时 ${formatDuration(elapsedMs / 1000)}`;
 }
 
 export function resolveUploadProjectSetting(settings) {
@@ -127,6 +132,13 @@ export async function runSync({
   // Built from the same `apiUrl` the ingest calls below use, so the recorded
   // target and the actual target can never drift apart.
   const identity = stateIdentity({ apiUrl, apiKey: config.apiKey });
+  // Both the settings round-trip and the log scan below can run for minutes on
+  // a cold or proxied machine (a timing-out endpoint retrying, a cold Codex
+  // index, a 120s Cursor export). A live status line keeps that work
+  // distinguishable from a hang; it never reaches a pipe, so the desktop apps
+  // keep parsing bare result text from stdout.
+  const status = liveStatus({ enabled: !quiet });
+  status.start(elapsedMs => `正在读取上传设置${phaseElapsed(elapsedMs)}`);
   let uploadProject;
   try {
     const settings = await fetchSettings(apiUrl, config.apiKey);
@@ -143,6 +155,7 @@ export async function runSync({
       saveConfig(config);
     }
   } catch (err) {
+    status.stop();
     if (err.message === 'UNAUTHORIZED') {
       console.error(failure('API Key 无效，请运行 `npx @vibe-cafe/vibe-usage init` 重新配置。'));
       if (throws) throw err;
@@ -173,8 +186,11 @@ export async function runSync({
   // Run parsers concurrently (bounded) so one slow parser (Cursor's network
   // fetch, a cold Codex index) can't stall the rest. Results are collected in
   // registry order so output and merged arrays stay deterministic.
+  const parserRegistry = Object.entries(parsers);
+  let parsedSources = 0;
+  status.start(elapsedMs => `正在扫描本地日志 ${parsedSources}/${parserRegistry.length}${phaseElapsed(elapsedMs)}`);
   const parserOutcomes = await mapWithConcurrency(
-    Object.entries(parsers),
+    parserRegistry,
     PARSER_CONCURRENCY,
     async ([source, parse]) => {
       try {
@@ -187,9 +203,12 @@ export async function runSync({
         return { source, result };
       } catch (err) {
         return { source, error: err };
+      } finally {
+        parsedSources++;
       }
     },
   );
+  status.stop();
 
   for (const { source, result, error } of parserOutcomes) {
     if (error) {

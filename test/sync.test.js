@@ -204,6 +204,78 @@ test('a quiet sync still writes a parser skip warning to stderr', async () => {
   }
 });
 
+// `sync` used to print its header and then nothing at all until every parser
+// had finished: a cold Codex index build or a 120s Cursor export left the
+// terminal blank for minutes, which is indistinguishable from a hang. The live
+// line is TTY-only, so a forced run proves the rendering and the redraw, while
+// an ordinary piped run proves the desktop apps still get bare result text.
+test('silent sync phases report live status only on a TTY', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vibe-usage-progress-'));
+  const configDir = join(root, 'config');
+  const stateDir = join(root, 'state');
+  const homeDir = join(root, 'home');
+  mkdirSync(configDir, { recursive: true });
+  mkdirSync(homeDir, { recursive: true });
+
+  try {
+    await withServer((req, res) => {
+      if (req.method === 'GET' && req.url === '/api/usage/settings') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ uploadProject: true }));
+        return;
+      }
+      res.writeHead(404).end();
+    }, async apiUrl => {
+      writeFileSync(join(configDir, 'config.json'), JSON.stringify({
+        apiKey: 'vbu_progress_test',
+        apiUrl,
+        hostname: 'progress-test',
+      }));
+      const command = `
+        import { parsers } from './src/parsers/index.js';
+        for (const source of Object.keys(parsers)) delete parsers[source];
+        parsers['progress-test'] = async () => {
+          await new Promise(resolve => setTimeout(resolve, 400));
+          return { buckets: [], sessions: [] };
+        };
+        const { runSync } = await import('./src/sync.js');
+        await runSync({ throws: true });
+      `;
+      const baseEnv = {
+        ...process.env,
+        HOME: homeDir,
+        VIBE_USAGE_DEV: '0',
+        VIBE_USAGE_CONFIG_DIR: configDir,
+        VIBE_USAGE_STATE_DIR: stateDir,
+      };
+      const runSyncProcess = extraEnv => execFileAsync(
+        process.execPath,
+        ['--input-type=module', '-e', command],
+        { cwd: process.cwd(), env: { ...baseEnv, ...extraEnv } },
+      );
+
+      const forced = await runSyncProcess({
+        VIBE_USAGE_FORCE_PROGRESS: '1',
+        VIBE_USAGE_PROGRESS_INTERVAL_MS: '100',
+      });
+      assert.match(forced.stdout, /正在读取上传设置 · 已用时 0s/);
+      // The 400ms parser outlives several 100ms ticks: the first render draws
+      // immediately, the rest prove the redraw keeps the line alive.
+      const scanRenders = forced.stdout.match(/正在扫描本地日志 0\/1 · 已用时 0s/g) || [];
+      assert.ok(scanRenders.length >= 2, `expected repeated status renders, got ${scanRenders.length}`);
+      // ...and the line is erased before the regular output continues on it.
+      assert.match(forced.stdout, /\x1b\[K/);
+
+      const piped = await runSyncProcess({});
+      assert.match(piped.stdout, /暂无新数据/);
+      assert.doesNotMatch(piped.stdout, /正在读取上传设置|正在扫描本地日志/);
+      assert.doesNotMatch(piped.stdout, /\x1b\[K/);
+    });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('formatDuration renders seconds, minutes and hours', () => {
   assert.equal(formatDuration(0), '0s');
   assert.equal(formatDuration(59), '59s');
