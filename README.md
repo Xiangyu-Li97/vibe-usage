@@ -84,7 +84,7 @@ Quota results are never uploaded or added to incremental sync state. Credential-
 | Grok | `$GROK_HOME/sessions/<encoded-cwd>/<session-id>/` (default `~/.grok`) plus explicitly added Grok Homes; token usage from `updates.jsonl` `turn_completed.usage` (per-model `modelUsage`, cache reads, reasoning); project from `summary.json` cwd; copied sessions keep the more complete local record |
 | GitHub Copilot CLI | `~/.copilot/session-state/*/events.jsonl` |
 | CraftAgent | `~/.craft-agent/workspaces/*/sessions/*/.pi-sessions/*.jsonl`; honors `$CRAFT_AGENT_DIR` / `$CRAFTAGENT_DIR`; cache writes are included in input usage |
-| Cursor | `state.vscdb` (SQLite, reads `cursorAuth/accessToken`, fetches CSV from `cursor.com`); cloud data is stamped with a fixed `cursor-cloud` hostname so multi-machine setups don't double-count |
+| Cursor | `state.vscdb` (SQLite; reads only the token Cursor itself already stored locally, never logs in or refreshes it) plus `cursor.com`'s usage CSV, with the dashboard's paginated usage-events API as fallback when the CSV is empty or changes shape; cloud data is stamped with a fixed `cursor-cloud` hostname so multi-machine setups don't double-count; `status` shows the signed-in account and newest event |
 | DimAgent | `$DIMCODE_HOME/dimcode.sqlite` (default `~/.dimcode/v2/dimcode.sqlite`); exact usage from `usage_ledger`, with forked ledger/history copies deduplicated |
 | Gemini CLI | `~/.gemini/tmp/<project_hash>/chats/session-*.jsonl` (current line-delimited format) and legacy `session-*.json`; recurses into nested subagent sessions |
 | OpenCode | `~/.local/share/opencode/opencode.db` (SQLite) — both the legacy `message` table and the 2.x `session_message` projection are read, merged by message id — with `storage/message/` as the legacy alternative; cache writes are counted as 5m cache creation; supports explicitly added data roots |
@@ -144,20 +144,23 @@ To relabel old history, the maintainer needs the old bucket keys, raw per-tool t
 - Uploads buckets + sessions to your vibecafe.ai dashboard (always gzip-compressed, ~94% smaller)
 - Incremental upload: every parser emits a complete local snapshot, then only buckets/sessions that are new or changed since the last successful upload are sent — a quiet machine uploads nothing. Upload state remains in `~/.vibe-usage/state.json`; failed or still-indexing parsers retain their prior state, while deleted local logs are pruned. Deleting the state file triggers a one-time full re-upload, and `reset` clears it automatically after deleting cloud data
 - Incremental Codex parsing: a versioned, disposable cache under `~/.vibe-usage/cache/codex/` stores per-rollout aggregate results and parser continuation state. Unchanged rollouts require no raw-log reads; an ordinary append reads only the new tail; forks, sub-agents, replacements, truncations, and failed safety checks fall back to the full correctness path. Multi-file sessions have a combined cache that rebuilds when any segment changes. A bounded rolling audit occasionally re-reads one historical file or continuation group. Very large first-time indexes checkpoint before the Mac app timeout and resume on the next sync instead of restarting
-- Interactive `sync` shows a live status line (`正在读取上传设置` → `正在扫描本地日志 12/35 · 已用时 2m10s`) while it reads backend settings and scans/indexes local logs. A first sync, a cold Codex index rebuild, or a slow `cursor.com` export can take minutes, so that line is what separates a slow sync from a hung one. It is printed only on a TTY — the Mac and Windows apps read the piped stdout as the result text and must keep receiving plain output. Interrupting a sync is safe: finished batches are already committed, and the Codex index checkpoints and resumes on the next run
+- Interactive `sync` shows a live status line (`正在读取上传设置` → `正在扫描本地日志 12/35 · 已用时 2m10s`) while it reads backend settings and scans/indexes local logs. A first sync, a cold Codex index rebuild, or a Cursor account with a long event history can take minutes, so that line is what separates a slow sync from a hung one. It is printed only on a TTY — the Mac and Windows apps read the piped stdout as the result text and must keep receiving plain output. Interrupting a sync is safe: finished batches are already committed, and the Codex index checkpoints and resumes on the next run
 - The Codex parser cache contains derived aggregates and replay metadata, not raw prompt or response text. It is independent of upload state and can be deleted safely (the next sync rebuilds it). `reset` intentionally keeps it so the required full re-upload does not also require a full disk rescan. Set `VIBE_USAGE_CODEX_CACHE=0` to disable the optimization for diagnosis
 - SQLite-backed tools are read via Node's built-in `node:sqlite` on Node ≥ 22.5 — no `sqlite3` binary needed (works on Windows out of the box); on older Node the CLI falls back to the system `sqlite3` executable
 - Continuous syncing is on by default: the first run installs a background service (see [Background sync](#background-sync)); the [Vibe Usage Mac app](https://github.com/vibe-cafe/vibe-usage-app) is the menu-bar alternative
 
 ## Cursor 网络排查
 
-Cursor 用量需要从 `cursor.com` 下载 CSV。`Cursor usage export skipped (network: …)` 表示这次下载失败；CLI 会保留 Cursor 的历史同步状态，下次同步重新尝试。
+Cursor 用量优先读取 `cursor.com` 的 CSV 导出（模型名最准确）。如果 CSV 为空、表头变化或没有 token 计数，会自动改用仪表盘自己的分页用量事件接口（`/api/dashboard/get-filtered-usage-events`）；该接口较早事件的模型名可能显示为 `default`，但 token 总量正确。CSV 仍可用但最新事件已超过 24 小时（且不超过 7 天）时，会只向事件接口补“CSV 最新事件之后”的增量，不覆盖或重传历史。`Cursor usage export skipped (network: …)` / `Cursor usage request skipped (network: …)` 表示这次请求失败；CLI 会保留 Cursor 的历史同步状态，下次同步重新尝试。
 
 - `ENOTFOUND` / `EAI_AGAIN`：检查 DNS 和终端网络。
 - `UND_ERR_CONNECT_TIMEOUT` / `ETIMEDOUT` / `ECONNRESET`：检查到 Cursor 的连接及终端代理。浏览器或 Cursor 应用能联网，不代表 Node.js 使用了相同代理。
 - `CERT_*` / `UNABLE_TO_VERIFY_LEAF_SIGNATURE` 等：检查系统时间和代理或公司网络的 CA 证书配置；自定义 CA 可通过 `NODE_EXTRA_CA_CERTS` 指定。
-- `timeout after …ms`：导出超时。`cursor.com` 的导出是按整个账号现算的，**账号用量越大越慢**，所以重度用户会每次都超时、而不是偶尔。默认等待 120 秒；仍不够就调大，例如 `VIBE_USAGE_CURSOR_FETCH_TIMEOUT_MS=300000`，然后重跑一次 `sync` 补传历史。
+- `timeout after …ms`：请求超时（每页默认 120 秒）。可用 `VIBE_USAGE_CURSOR_FETCH_TIMEOUT_MS=300000` 调大，然后重跑一次 `sync` 补传历史。
 - `Cursor session rejected`：在 Cursor 的 Account 设置中重新登录，再同步。
+- 数据停在某一天、或刚换过 Cursor 账号：运行 `npx @vibe-cafe/vibe-usage status`。它会显示 Cursor 当前登录账号（本地脱敏标签）和最新事件时间；如果最新事件超过 48 小时且你最近用过 Cursor，通常是客户端仍登录旧账号。切换账号后 Cursor 的本地 `state.vscdb` 会更新，重新同步即可。
+- X 订阅（The X Subscription）账号的用量由 Cursor 与 Grok 共享：如果 Cursor 仪表盘本身没有新事件，请到 `grok.com/dashboard` 的 Usage 查看；CLI 只能读取 Cursor 仪表盘返回的 Cursor 事件。
+- 只有 X Premium+ / Grok 订阅、但 Cursor 里显示 `Free`：X Premium+ 不会自动把 Cursor 计划升级，需要在 `cursor.com/unify` 合并到 The X Subscription 后，Cursor 用量才进入共享池。`cursor.com/api/dashboard/get-sand-usage-status` 返回 `includedUsageSuperGrokPlan: "x-premium-plus"` 且 `cursorPlanName: "Free"` 就是这种状态。
 
 需要 HTTP/HTTPS 代理时，Node.js **22.21+ 或 24.5+** 可用 `NODE_USE_ENV_PROXY=1` 启用环境变量代理（[Node.js 官方说明](https://nodejs.org/en/learn/http/enterprise-network-configuration)）。以下为 macOS/Linux 终端示例，代理地址须替换为实际地址：
 

@@ -79,6 +79,67 @@ export function reaggregateHiddenProjectBuckets(buckets) {
   })));
 }
 
+/**
+ * Compare local parser diagnostics (Cursor's signed-in account and newest
+ * event) with the previous run and warn only on a meaningful change. The
+ * values live in state.json under `parserMeta`; they are local diagnostics,
+ * never uploaded, and older CLIs ignore them.
+ *
+ * This is how an account switch stops being silent: the old token keeps
+ * returning the old account's history, so the dashboard simply stops growing
+ * while every sync still "succeeds". `status` prints the recorded account and
+ * newest event for the same reason.
+ */
+export function applyParserInfos(state, parserInfos) {
+  if (!Array.isArray(parserInfos) || parserInfos.length === 0) return false;
+  if (!state.parserMeta || typeof state.parserMeta !== 'object') state.parserMeta = {};
+  let changed = false;
+
+  for (const { source, info } of parserInfos) {
+    if (!info || typeof info !== 'object' || Array.isArray(info)) continue;
+    const previous = state.parserMeta[source];
+    if (source === 'cursor') {
+      const warnings = [];
+      if (previous?.account && info.account && previous.account !== info.account) {
+        warnings.push(
+          `cursor: Cursor 登录账号已从 ${previous.account} 更换为 ${info.account}；`
+          + '如果这不是你刚切换的账号，请在 Cursor 设置中重新登录。',
+        );
+      }
+      if (previous?.latestEventAt && info.latestEventAt) {
+        const before = Date.parse(previous.latestEventAt);
+        const after = Date.parse(info.latestEventAt);
+        if (Number.isFinite(before) && Number.isFinite(after) && after < before) {
+          warnings.push(
+            `cursor: Cursor 最新事件从 ${previous.latestEventAt} 回退到 ${info.latestEventAt}；`
+            + '这通常意味着当前登录的是另一个（更旧的）Cursor 账号。',
+          );
+        }
+      }
+      if (previous?.tokenEvents > 0 && info.tokenEvents === 0) {
+        warnings.push(
+          `cursor: Cursor 本次没有读到可上传的 token 用量（账号 ${info.account || '未知'}，`
+          + `事件 ${info.events ?? 0}）。如果最近用过 Cursor，请运行 status 确认登录账号；`
+          + 'X 订阅的用量也可能并入 grok.com/dashboard。',
+        );
+      } else if (previous?.events > 0 && info.events === 0) {
+        warnings.push(
+          `cursor: Cursor 本次没有返回任何用量事件（账号 ${info.account || '未知'}）；`
+          + '如果最近用过 Cursor，请确认 Cursor 仍登录该账号。',
+        );
+      }
+      for (const message of warnings) {
+        process.stderr.write(`${dim(`  ${message}`)}\n`);
+      }
+    }
+    if (JSON.stringify(previous ?? null) !== JSON.stringify(info)) {
+      state.parserMeta[source] = info;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
 // Parser execution is I/O bound (log reads, occasional network calls). Run a
 // bounded number at once to cut wall-clock sync time without the memory spike
 // of loading every tool's logs simultaneously.
@@ -174,10 +235,16 @@ export async function runSync({
     }
   }
 
+  // Loaded before parsing so a stateful parser can use the previous run's
+  // diagnostics (Cursor uses the last event time to gate its events fallback
+  // and avoid re-uploading already-known history under a different model id).
+  const state = loadState(identity);
+
   let allBuckets = [];
   const allSessions = [];
   const parserResults = [];
   const parserProgress = [];
+  const parserInfos = [];
   // Sources whose parser ran to completion this sync. pruneState() below is
   // scoped to these so a transient parser failure doesn't evict that tool's
   // state and force a full re-upload next run.
@@ -196,6 +263,7 @@ export async function runSync({
       try {
         const result = await parse({
           extraRoots: extraRootList(config.extraRoots?.[source]),
+          previousInfo: state.parserMeta?.[source],
           ...(source === 'codex' ? {
             codexExtraHome: resolveCodexExtraHome(config.codexExtraHome, codexExtraHome),
           } : {}),
@@ -223,10 +291,11 @@ export async function runSync({
       process.stderr.write(`${dim(`  ${source}: ${err.message}`)}\n`);
       continue;
     }
-    const { buckets, sessions, skipped, warnings, indexing } = normalized;
+    const { buckets, sessions, skipped, warnings, indexing, info } = normalized;
     if (indexing) {
       parserProgress.push({ source, ...indexing });
     }
+    if (info) parserInfos.push({ source, info });
     // Parser warnings always reach stderr, including quiet (daemon) runs: the
     // daemon log is the only trail a background failure leaves. Cursor's fetch
     // soft-skip used to be filtered out here to keep that log tidy, which made
@@ -250,14 +319,14 @@ export async function runSync({
     // Successful parsers emitted no live items. Prune their old keys even on
     // this fast path; otherwise deleting the final local log would leave dead
     // state entries forever. Failed-parser sources remain protected.
-    const state = loadState(identity);
     if (state.identityChanged && !quiet) {
       console.log(dim('检测到上传账号已更换，本次全量重传本地历史'));
     }
     const before = Object.keys(state.buckets).length + Object.keys(state.sessions).length;
     pruneState(state, new Set(), new Set(), okSources);
     const pruned = before - (Object.keys(state.buckets).length + Object.keys(state.sessions).length);
-    if (pruned > 0) saveState(state, identity);
+    const metaChanged = applyParserInfos(state, parserInfos);
+    if (pruned > 0 || metaChanged) saveState(state, identity);
     if (!quiet && parserProgress.length > 0) {
       for (const p of parserProgress) {
         console.log(dim(`  ${p.source}: 正在建立本地索引 ${p.completed}/${p.total}（下次同步继续）`));
@@ -313,10 +382,10 @@ export async function runSync({
   // an active one sends just the current 30-min bucket.
   // Missing/corrupt state.json => empty maps => one-time full upload, then
   // incremental forever after.
-  const state = loadState(identity);
   if (state.identityChanged && !quiet) {
     console.log(dim('检测到上传账号已更换，本次全量重传本地历史'));
   }
+  const metaChanged = applyParserInfos(state, parserInfos);
   let migration;
   try {
     migration = planKikiMigration(allBuckets, allSessions, state, config.kikiStartAt);
@@ -399,7 +468,7 @@ export async function runSync({
   const before = Object.keys(state.buckets).length + Object.keys(state.sessions).length;
   pruneState(state, liveBucketKeys, liveSessionKeys, okSources);
   const pruned = before - (Object.keys(state.buckets).length + Object.keys(state.sessions).length);
-  if (pruned > 0) saveState(state, identity);
+  if (pruned > 0 || metaChanged) saveState(state, identity);
 
   if (changedBuckets.length === 0 && changedSessions.length === 0) {
     if (!quiet) console.log(dim('无新增数据。'));

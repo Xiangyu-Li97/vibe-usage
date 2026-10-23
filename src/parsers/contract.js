@@ -2,8 +2,10 @@
  * Parser result contract.
  *
  * Every parser exports an async parse() returning either
- *   { buckets: object[], sessions: object[], skipped?: boolean, warnings?: string[], indexing?: object }
- * or a legacy bare buckets array.
+ *   { buckets: object[], sessions: object[], skipped?: boolean, warnings?: string[], indexing?: object,
+ *     info?: object }
+ * or a legacy bare buckets array. `info` is optional local diagnostics (for
+ * example Cursor's signed-in account and newest event); it is never uploaded.
  *
  * buckets entries are the aggregateToBuckets() output shape
  * ({ source, model, project, hostname?, bucketStart, inputTokens, ... }).
@@ -51,5 +53,6 @@ export function normalizeParserResult(source, result) {
     skipped: result?.skipped === true,
     warnings,
     ...(result?.indexing ? { indexing: result.indexing } : {}),
+    ...(result?.info && typeof result.info === 'object' ? { info: result.info } : {}),
   };
 }

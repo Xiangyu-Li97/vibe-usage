@@ -52,24 +52,37 @@ function sameIdentity(a, b) {
 // `identity` is optional: callers that only read the recorded counts (e.g.
 // `status`) pass nothing and keep the pre-0.11.1 behaviour of taking the file
 // at face value.
+function parserMetaFrom(parsed) {
+  const meta = parsed?.parserMeta;
+  return meta && typeof meta === 'object' && !Array.isArray(meta) ? meta : {};
+}
+
 export function loadState(identity) {
   if (!existsSync(STATE_FILE)) return { buckets: {}, sessions: {} };
   try {
     const parsed = JSON.parse(readFileSync(STATE_FILE, 'utf-8'));
     const buckets = parsed.buckets ?? {};
     const sessions = parsed.sessions ?? {};
+    // Local parser diagnostics (currently Cursor's account/newest event).
+    // Purely additive; older CLIs ignore it and it never enters an upload.
+    const parserMeta = parserMetaFrom(parsed);
+    const withMeta = (value) => (Object.keys(parserMeta).length > 0
+      ? { ...value, parserMeta }
+      : value);
     if (!isIdentity(identity) || !isIdentity(parsed.identity)) {
       // No identity recorded — written by a CLI older than 0.11.1. Adopt the
       // entries as-is rather than forcing a re-upload: on upgrade day that
       // would make every installed client re-send its whole history at once.
       // The next saveState() stamps the current identity, so any later re-bind
       // is caught.
-      return { buckets, sessions };
+      return withMeta({ buckets, sessions });
     }
-    if (sameIdentity(parsed.identity, identity)) return { buckets, sessions };
+    if (sameIdentity(parsed.identity, identity)) return withMeta({ buckets, sessions });
     // Bound to a different account or server: nothing recorded here was ever
     // uploaded to the current target, so start empty and re-send local history.
     // `identityChanged` is a runtime signal for the caller, never persisted.
+    // Parser diagnostics describe the old target's local source, so they are
+    // dropped with the old hashes.
     return { buckets: {}, sessions: {}, identityChanged: true };
   } catch {
     // Corrupt/unreadable state must not lose data — treat as empty, which
@@ -91,6 +104,10 @@ export function saveState(state, identity) {
     buckets: state.buckets ?? {},
     sessions: state.sessions ?? {},
   };
+  if (state.parserMeta && typeof state.parserMeta === 'object'
+    && Object.keys(state.parserMeta).length > 0) {
+    payload.parserMeta = state.parserMeta;
+  }
   if (isIdentity(identity)) {
     payload.identity = {
       apiUrl: identity.apiUrl,

@@ -76,7 +76,9 @@ async function showStatus() {
     // reads exactly like a healthy one, which is how a stale bundled CLI stayed
     // invisible (issue #100). state.json is the only local record of what was
     // actually uploaded, so count it per source.
-    const uploaded = uploadedItemCounts(loadState());
+    const state = loadState();
+    const uploaded = uploadedItemCounts(state);
+    const cursorInfo = state.parserMeta?.cursor;
     for (const tool of detected) {
       const buckets = uploaded.buckets.get(tool.id) || 0;
       const sessions = uploaded.sessions.get(tool.id) || 0;
@@ -85,6 +87,19 @@ async function showStatus() {
       } else {
         console.log(`    ${tool.name}  ·  尚未上传过数据`);
         console.log(dimText('       本机检测到数据，但本地没有这条工具的上传记录：运行 `npx @vibe-cafe/vibe-usage` 同步'));
+      }
+      if (tool.id === 'cursor' && cursorInfo) {
+        const detail = [];
+        if (cursorInfo.account) detail.push(`账号 ${cursorInfo.account}`);
+        if (cursorInfo.latestEventAt) {
+          detail.push(`最新事件 ${String(cursorInfo.latestEventAt).slice(0, 16).replace('T', ' ')}Z`);
+        }
+        if (Number.isFinite(cursorInfo.events)) detail.push(`${cursorInfo.events} 个事件`);
+        if (detail.length > 0) console.log(dimText(`       ${detail.join(' · ')}`));
+        const latest = Date.parse(cursorInfo.latestEventAt);
+        if (Number.isFinite(latest) && Date.now() - latest > 48 * 60 * 60 * 1000) {
+          console.log(dimText('       已超过 48 小时没有新的 Cursor 事件；如最近用过 Cursor，请确认 Cursor 登录的是这个账号'));
+        }
       }
     }
     console.log();

@@ -20,6 +20,22 @@ test('saveState/loadState round-trips buckets and sessions', () => {
   assert.deepEqual(loadState(), state);
 });
 
+test('parser diagnostics round-trip and are dropped with a re-bound account', () => {
+  const state = {
+    buckets: { 'codex|m|p|h|t': 'hash1' },
+    sessions: {},
+    parserMeta: { cursor: { account: 'github|user…1234', latestEventAt: '2026-09-07T01:00:00.000Z', events: 7 } },
+  };
+  saveState(state);
+  assert.deepEqual(loadState(), state);
+
+  saveState(state, ACCOUNT_A);
+  assert.deepEqual(loadState(ACCOUNT_A), state);
+  const rebound = loadState(ACCOUNT_B);
+  assert.deepEqual(rebound.buckets, {});
+  assert.equal(rebound.parserMeta, undefined);
+});
+
 test('saveState writes atomically without leaving temp files behind', () => {
   saveState({ buckets: { a: '1' }, sessions: {} });
   const files = readdirSync(dir);
