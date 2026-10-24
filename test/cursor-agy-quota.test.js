@@ -61,7 +61,7 @@ test('Cursor reads only its login row, including UTF-16 BLOBs, without changing 
     assert.deepEqual(readFileSync(dbPath), before);
   }
   assert.equal(cursorQuotaDbPath({ APPDATA: '/fixture/AppData' }, '/fixture', 'win32'),
-    '/fixture/AppData/Cursor/User/globalStorage/state.vscdb');
+    join('/fixture/AppData', 'Cursor', 'User', 'globalStorage', 'state.vscdb'));
 });
 
 test('Cursor authenticates only to the fixed official host and sanitizes results', async t => {
