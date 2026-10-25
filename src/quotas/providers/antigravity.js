@@ -26,17 +26,23 @@ export function antigravityBinary(environment = process.env, home = homedir(), p
   });
 }
 
+const isGeminiGroup = group => Array.isArray(group?.buckets)
+  && group.buckets.some(bucket => bucket?.bucketId === 'gemini-5h' || bucket?.bucketId === 'gemini-weekly');
+
+/** The card shows one family's 5h/7d like every other product: Gemini, the
+ * default models, or the first family when a response has no Gemini group.
+ * Every group is still validated so a malformed response is never shown. */
 export function parseAntigravityQuota(payload) {
   if (payload?.code && payload.code !== 'ok' && payload.code !== 0) throw new Error('Quota API error');
   const summary = payload?.response ?? payload?.summary ?? payload;
   if (!Array.isArray(summary?.groups)) throw new Error('Missing quota groups');
-  const meters = [];
+  const families = [];
   const seen = new Set();
-  const groupForId = new Map();
-  for (const [groupIndex, group] of summary.groups.entries()) {
+  for (const group of summary.groups) {
     if (!Array.isArray(group.buckets)) throw new Error('Invalid quota group');
     const family = typeof group.displayName === 'string'
       ? group.displayName.replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0,80) : 'Antigravity';
+    const meters = [];
     for (const bucket of group.buckets) {
       if (bucket.disabled === true) continue;
       const fraction = bucket.remainingFraction ?? bucket.remaining?.remainingFraction
@@ -51,21 +57,18 @@ export function parseAntigravityQuota(payload) {
         throw new Error('Invalid quota bucket identity');
       }
       seen.add(id);
-      groupForId.set(id, groupIndex);
       const weekly = /weekly/i.test(id);
       const fiveHour = /(?:^|-)5h$/.test(id);
-      const name = id.startsWith('3p-') ? 'Claude + GPT'
-        : id === 'gemini-weekly' || id === 'gemini-5h' ? 'Gemini' : family;
-      const label = `${name}${weekly ? ' 7d' : fiveHour ? ' 5h' : ''}`;
       const reset = typeof bucket.resetTime === 'string' ? Date.parse(bucket.resetTime) : NaN;
-      meters.push({ id, label, utilization: (1 - fraction) * 100,
+      meters.push({ id, label: weekly ? '7d' : fiveHour ? '5h' : family, utilization: (1 - fraction) * 100,
         ...(Number.isFinite(reset) ? { resetsAt: new Date(reset).toISOString() } : {}),
         ...(weekly ? { windowSeconds: 604800 } : fiveHour ? { windowSeconds: 18000 } : {}) });
     }
+    families.push({ gemini: isGeminiGroup(group), meters });
   }
-  // Keep each family's short window before its weekly window.
-  return meters.sort((a,b) => groupForId.get(a.id) - groupForId.get(b.id)
-    || (a.windowSeconds || Infinity) - (b.windowSeconds || Infinity));
+  const shown = families.find(family => family.gemini) ?? families.find(family => family.meters.length);
+  return (shown?.meters ?? [])
+    .sort((a,b) => (a.windowSeconds || Infinity) - (b.windowSeconds || Infinity));
 }
 
 export function requestAntigravityQuota({ port, token, timeoutMs = 2000 }) {

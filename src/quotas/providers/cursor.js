@@ -51,25 +51,34 @@ export function parseCursorQuota(payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)
       || !payload.individualUsage && !payload.teamUsage) throw new Error('Invalid Cursor quota response');
   const meters = [];
-  const reset = typeof payload.billingCycleEnd === 'string' ? Date.parse(payload.billingCycleEnd) : NaN;
-  const resetsAt = Number.isFinite(reset) ? new Date(reset).toISOString() : undefined;
-  const add = (id, label, value) => {
-    if (finite(value)) meters.push({ id, label, utilization: value, resetsAt });
+  const date = value => typeof value === 'string' ? Date.parse(value) : NaN;
+  const start = date(payload.billingCycleStart);
+  const end = date(payload.billingCycleEnd);
+  const resetsAt = Number.isFinite(end) ? new Date(end).toISOString() : undefined;
+  // The real cycle length lets the card draw the same elapsed-time bar as Codex.
+  const windowSeconds = Number.isFinite(start) && end > start ? (end - start) / 1000 : undefined;
+  const add = (id, label, value, extra = {}) => {
+    if (finite(value)) meters.push({ id, label, utilization: value, resetsAt, windowSeconds, ...extra });
   };
   const ratio = item => item?.enabled !== false && finite(item?.used) && finite(item?.limit) && item.limit > 0
     ? item.used / item.limit * 100 : undefined;
   const plan = payload.individualUsage?.plan;
   if (plan?.enabled !== false) {
-    add('plan', 'Month', finite(plan?.totalPercentUsed) ? plan.totalPercentUsed : ratio(plan));
-    // These values already use percentage units: 0.36 means 0.36%, not 36%.
-    add('cursor', 'Cursor models', plan?.autoPercentUsed);
-    add('third-party', 'Third-party models', plan?.apiPercentUsed);
+    // Auto/API split the same allowance, so they ride along as detail of the
+    // one Month row instead of reading as separate limits. Percentage units:
+    // 0.36 means 0.36%, not 36%.
+    const breakdown = [['auto', 'Cursor models', plan?.autoPercentUsed],
+      ['api', 'Third-party models', plan?.apiPercentUsed]]
+      .filter(([, , value]) => finite(value))
+      .map(([id, label, utilization]) => ({ id, label, utilization }));
+    add('plan', 'Month', finite(plan?.totalPercentUsed) ? plan.totalPercentUsed : ratio(plan),
+      breakdown.length ? { breakdown } : {});
   }
   if (!meters.length) {
-    add('personal', 'Personal limit', ratio(payload.individualUsage?.overall));
-    if (!meters.length) add('team', 'Team pool', ratio(payload.teamUsage?.pooled));
+    add('personal', 'Month', ratio(payload.individualUsage?.overall));
+    if (!meters.length) add('team', 'Team', ratio(payload.teamUsage?.pooled));
   }
-  add('on-demand', 'On-demand limit', ratio(payload.individualUsage?.onDemand));
+  add('on-demand', 'On-demand', ratio(payload.individualUsage?.onDemand));
   return meters;
 }
 

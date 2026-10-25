@@ -9,7 +9,7 @@ import { fetchAntigravityQuota, parseAntigravityQuota, withAntigravitySession } 
 import { fetchQuotaProducts, discoverQuotaProducts } from '../src/quotas/registry.js';
 
 const token = `header.${Buffer.from(JSON.stringify({ sub: 'fixture-account' })).toString('base64url')}.fixture-signature`;
-const cursorPayload = { billingCycleEnd: '2026-11-01T00:00:00Z', membershipType: 'premium',
+const cursorPayload = { billingCycleStart: '2026-10-01T00:00:00Z', billingCycleEnd: '2026-11-01T00:00:00Z', membershipType: 'premium',
   individualUsage: { plan: { enabled: true, totalPercentUsed: .36, autoPercentUsed: 0,
     apiPercentUsed: .72, used: 90, limit: 100 } } };
 const agyPayload = { response: { groups: [
@@ -40,8 +40,15 @@ async function fixture(t, encoding = 'utf8', login = token) {
 
 test('Cursor preserves percentage units, zero and reset, and never invents a missing limit', () => {
   const meters = parseCursorQuota(cursorPayload);
-  assert.deepEqual(meters.map(m => m.utilization), [.36,0,.72]);
+  assert.deepEqual(meters.map(m => [m.id, m.label, m.utilization]), [['plan', 'Month', .36]]);
+  assert.deepEqual(meters[0].breakdown, [{ id: 'auto', label: 'Cursor models', utilization: 0 },
+    { id: 'api', label: 'Third-party models', utilization: .72 }]);
   assert.equal(meters[0].resetsAt, '2026-11-01T00:00:00.000Z');
+  assert.equal(meters[0].windowSeconds, 31 * 86400);
+  const onDemand = parseCursorQuota({ ...cursorPayload, individualUsage: { ...cursorPayload.individualUsage,
+    onDemand: { enabled: true, used: 1250, limit: 5000 } } });
+  assert.deepEqual(onDemand.map(m => [m.id, m.label, m.utilization]), [['plan', 'Month', .36], ['on-demand', 'On-demand', 25]]);
+  assert.equal(parseCursorQuota({ individualUsage: { plan: { totalPercentUsed: 5 } } })[0].windowSeconds, undefined);
   assert.deepEqual(parseCursorQuota({ individualUsage: { plan: {} } }), []);
   assert.deepEqual(parseCursorQuota({ individualUsage: { plan: { enabled: false, totalPercentUsed: 90 } } }), []);
   assert.throws(() => parseCursorQuota({ error: 'bad response' }));
@@ -118,17 +125,19 @@ test('Cursor malformed/oversized responses and network errors never echo secrets
   }
 });
 
-test('AGY parses known and new model families; missing fractions stay unknown', () => {
+test('AGY shows only the Gemini family as 5h/7d; other families are validated but not shown', () => {
   const meters = parseAntigravityQuota(agyPayload);
-  assert.equal(meters.length,4);
-  assert.equal(meters.find(m => m.id === 'gemini-weekly').utilization,25);
-  assert.equal(meters.find(m => m.id === 'gemini-5h').utilization,100);
-  assert.equal(meters.find(m => m.id === '3p-weekly').utilization,0);
-  assert.equal(meters.find(m => m.id === 'gemini-argon-wtu-weekly').label,'Gemini 4 Argon 7d');
-  assert.ok(meters.findIndex(m => m.id === 'gemini-5h') < meters.findIndex(m => m.id === 'gemini-weekly'));
+  assert.deepEqual(meters.map(m => [m.id, m.label, m.utilization, m.windowSeconds]),
+    [['gemini-5h', '5h', 100, 18000], ['gemini-weekly', '7d', 25, 604800]]);
+  assert.equal(meters[1].resetsAt, '2026-11-01T00:00:00.000Z');
+  // Without a Gemini group, the first family with data still fills the card.
+  const others = parseAntigravityQuota({ response: { groups: agyPayload.response.groups.slice(1) } });
+  assert.deepEqual(others.map(m => [m.id, m.label]), [['3p-weekly', '7d']]);
   for (const value of [-.1,1.1,'0.5',Infinity]) {
     const payload = structuredClone(agyPayload);payload.response.groups[0].buckets[0].remainingFraction = value;
     assert.throws(() => parseAntigravityQuota(payload));
+    const hidden = structuredClone(agyPayload);hidden.response.groups[1].buckets[0].remaining.value = value;
+    assert.throws(() => parseAntigravityQuota(hidden));
   }
   assert.throws(() => parseAntigravityQuota({ code: 'unauthenticated' }));
 });
